@@ -573,6 +573,17 @@ def parse_result(text):
 # ========================= 通知 =========================
 
 def send_notification(title, content):
+    # 失败类通知统一加醒目前缀与排查提示；成功类不在此推送（成功静默）
+    if "失败" in title:
+        title = "⚠️⚠️ " + title
+        content = (
+            "【福利吧签到失败提醒】\n"
+            + content
+            + "\n\n常见原因与处理：\n"
+            "1) Cookie 已过期：更新仓库 Secret 的 FORUM_COOKIE，或删除 cookies.json 缓存后用账号密码重新登录；\n"
+            "2) 账号密码失效：检查 FORUM_USERNAME / FORUM_PASSWORD 是否仍有效；\n"
+            "3) 网站结构变更：可稍后手动重试或关注项目更新。"
+        )
     token = os.environ.get("PUSHPLUS_TOKEN", "")
     if token:
         try:
@@ -689,8 +700,6 @@ def main():
     print("[3] 检查签到状态 ...")
     if check_already_signed(html):
         print("[OK] 今日已签到，无需重复操作")
-        send_notification(f"[签到成功] {args.mode}",
-                          f"时间:{now}\n状态:今日已签到")
         sys.exit(0)
     print("  -> 今日尚未签到，执行签到 ...")
 
@@ -706,8 +715,6 @@ def main():
     success, message = parse_result(text)
     if success:
         print(f"[OK] {message}")
-        send_notification(f"[签到成功] {args.mode}",
-                          f"时间:{now}\n结果:{message}")
     else:
         print(f"[FAIL] {message}")
         send_notification(f"[签到失败] {args.mode}",

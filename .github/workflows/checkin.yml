@@ -2,18 +2,29 @@ name: 福利吧自动签到
 
 on:
   schedule:
-    # 北京时间 09:00 与 22:00（对应 UTC 01:00 / 14:00）
-    - cron: "0 17,14 * * *"
+    # 三场互为兜底，且刻意避开整点（原因见下）。
+    #   北京 01:07  -> UTC 17:07   （主签到）
+    #   北京 09:23  -> UTC 01:23   （上午兜底）
+    #   北京 21:37  -> UTC 13:37   （晚间兜底 / 复查）
+    #
+    # 【为什么避开整点】GitHub 官方文档说明：schedule 事件在整点（start of
+    # every hour）等高峰时段会被延迟，负载足够高时整场会被直接丢弃。
+    # 原先写的是 "0 17,14 * * *"（两个整点），实测 UTC 14:00 那场长期不触发。
+    # 错开到 :07 / :23 / :37 可显著降低被延迟和丢弃的概率。
+    # 脚本已做幂等 + 结尾复核，多跑无害。
+    - cron: "7 17 * * *"
+    - cron: "23 1 * * *"
+    - cron: "37 13 * * *"
   workflow_dispatch: {}
 
 permissions:
-  contents: read
-  actions: write   # actions/cache 保存缓存需要写权限
+  contents: write   # 「保活提交」需要写权限（见最后一个 step）
+  actions: write    # actions/cache 保存缓存需要写权限
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -30,17 +41,50 @@ jobs:
         uses: actions/cache@v4
         with:
           path: cookies.json
-          # 用 run_id 作 key，每次都是新 key → 结束时 cache 的 save 步骤总会写入最新 cookie
+          # 用 run_id 作 key，每次都是新 key -> 结束时 cache 的 save 步骤总会写入最新 cookie
           # restore-keys 用前缀匹配，自动恢复上一次 run 缓存的 cookie（跨 run 复用）
           key: wnflb-cookies-${{ github.run_id }}
           restore-keys: |
             wnflb-cookies-
 
-      - name: 执行签到
+      - name: 执行签到（失败自动重试一次）
         env:
           FORUM_USERNAME: ${{ secrets.FORUM_USERNAME }}
           FORUM_PASSWORD: ${{ secrets.FORUM_PASSWORD }}
           FORUM_COOKIE: ${{ secrets.FORUM_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
-        run: python wnflb_checkin.py
+        # 脚本内部已带「复核」：只有确认页面真的变成已签到才 exit 0，
+        # 因此任何"没签上"的情况都会让这一步失败（Actions 变红），不再静默 success。
+        # 这里再加一层：整轮失败就等 60 秒重跑一次，抵御偶发网络/风控抖动。
+        run: |
+          python wnflb_checkin.py && exit 0
+          echo "::warning::第一次签到未通过，60 秒后重试一次"
+          sleep 60
+          python wnflb_checkin.py
+
+      - name: 保活提交（自动续期，防止 60 天不活跃被停用）
+        # 【为什么需要】GitHub 政策：仓库连续 60 天无活动，scheduled workflow 会被
+        # 自动禁用（本仓库就因此在 2026-10-15 被停用，导致 10-16 漏签）。
+        # 【做法】每满 30 天写一次时间戳并提交，把"最后活动时间"持续前推，
+        # 永久重置 60 天计时器。间隔取 30 天 = 在 60 天红线前留一倍余量，
+        # 即使某次运行被 GitHub 丢弃，隔天仍会补上；同时避免每天刷 commit。
+        # 【注意】用 if: always()，签到失败也照常执行——保活与签到成败无关。
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p .keepalive
+          now=$(date -u +%s)
+          last=$(cat .keepalive/last.txt 2>/dev/null || echo 0)
+          days=$(( (now - last) / 86400 ))
+          echo "距上次保活提交已 ${days} 天（阈值 30 天）"
+          if [ "$days" -lt 30 ]; then
+            echo "未满 30 天，跳过本次保活提交"
+            exit 0
+          fi
+          echo "$now" > .keepalive/last.txt
+          git add .keepalive/last.txt
+          git commit -m "chore(keepalive): 自动续期 $(date -u +%Y-%m-%d)"
+          git push
+          echo "保活提交完成，60 天计时器已重置"

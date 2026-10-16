@@ -698,10 +698,16 @@ def main():
 
     # 3) 签到
     print("[3] 检查签到状态 ...")
+    # 【为什么不再短路跳过】原逻辑是 if check_already_signed(html): print("已签到"); exit(0)。
+    # 而 check_already_signed 只看页面里的 JS 变量 fx_chk_menu，一旦页面渲染异常、
+    # 命中缓存或判断偏差，脚本就会在"其实没签到"的情况下打印「今日已签到」并 exit 0
+    # —— GitHub Actions 显示 success，实际什么都没做（静默失败）。
+    # 现在改为：无论页面怎么说，都真实调用一次签到接口。该接口幂等，
+    # 已签到时会返回"您今日已签到，无需重复签到"，不会产生任何副作用。
     if check_already_signed(html):
-        print("[OK] 今日已签到，无需重复操作")
-        sys.exit(0)
-    print("  -> 今日尚未签到，执行签到 ...")
+        print("  -> 页面显示今日已签到，仍调用接口确认一次（幂等，无副作用）")
+    else:
+        print("  -> 今日尚未签到，执行签到 ...")
 
     formhash, fx_formhash = extract_formhash(html)
     if not formhash:
@@ -720,6 +726,30 @@ def main():
         send_notification(f"[签到失败] {args.mode}",
                           f"时间:{now}\n结果:{message}")
         sys.exit(1)
+
+    # 4) 复核：重新拉取首页，确认 fx_chk_menu 真的变成了 true。
+    # 只有复核通过才 exit 0；否则 exit 1，让 Actions 变红告警，
+    # 彻底杜绝"表面 success、实际没签上"的静默失败。
+    print("[4] 复核签到结果 ...")
+    verified = False
+    for attempt in range(1, 4):
+        time.sleep(3)
+        try:
+            ok, page = verify_login(session)
+        except Exception as e:
+            print(f"  [复核] 第 {attempt}/3 次请求异常: {e}")
+            continue
+        if ok and page and check_already_signed(page):
+            verified = True
+            break
+        print(f"  [复核] 第 {attempt}/3 次未确认已签到，稍后重试 ...")
+
+    if not verified:
+        msg = "签到接口已返回，但复核未确认页面状态为已签到"
+        print(f"[FAIL] {msg}")
+        send_notification(f"[签到失败] {args.mode}", f"时间:{now}\n结果:{msg}")
+        sys.exit(1)
+    print("[OK] 复核通过：今日签到已生效")
 
 
 if __name__ == "__main__":

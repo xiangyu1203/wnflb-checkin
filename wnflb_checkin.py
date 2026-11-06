@@ -936,6 +936,12 @@ def main():
         logged, html = verify_login(session)
         if not logged:
             print("[FAIL] 登录后首页校验未通过")
+            # 诊断：只打印 cookie 名（不打印值）与首页 discuz_uid，
+            # 定位是登录 POST 没存下 auth cookie，还是首页校验逻辑误判
+            print(f"  [诊断] 会话 cookie: {sorted(c.name for c in session.cookies)}")
+            m = re.search(r"discuz_uid\s*=\s*'(\d+)'", html or "")
+            print(f"  [诊断] 首页 discuz_uid: {m.group(1) if m else '未找到'}")
+            print(f"  [诊断] 首页含登出链接: {'mod=logging&action=logout' in (html or '')}")
             sys.exit(1)
 
     # 3) 签到

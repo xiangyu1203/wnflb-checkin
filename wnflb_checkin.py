@@ -508,6 +508,14 @@ def _submit_login(session, formhash, loginhash, username="", password="",
         if cdata:
             msg = re.sub(r"<[^>]+>", "", cdata.group(1)).strip()
 
+    # 登录成功页的直接信号：Discuz 成功页含 succeedmessage/succeedlocation
+    # 元素或“欢迎您回来”，POST 响应本身就是权威结果，不必再依赖首页二次校验。
+    # 注意：只认 id="..." 元素或成功问候语，不认 JS 里的 $('succeedmessage')
+    # 引用（错误页也可能含同一段共用 JS），避免把错误页误判为成功。
+    if (re.search(r'id\s*=\s*["\']succeed(?:message|location)["\']', txt)
+            or "欢迎您回来" in txt):
+        return True, "登录成功", txt
+
     # 仍被要求验证码（验证码错误等）
     if "请输入验证码" in txt and "auth=" in txt:
         return False, (msg or "验证码不正确，请重试"), txt

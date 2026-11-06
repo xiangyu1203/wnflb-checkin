@@ -923,6 +923,11 @@ def main():
             send_notification("[签到失败] 需登录", f"时间:{now}\n错误:{msg}")
             sys.exit(1)
         print("[2] 使用账号密码登录 ...")
+        # 先清空会话中残留的旧 cookie：FORUM_COOKIE/cookies.json 里的旧 auth
+        # 与新登录的 auth 同名但 domain/path 不同，会在 jar 里并存成两份；
+        # 请求时两份一起发，服务端会读到旧的那份而判为游客（discuz_uid=0）。
+        # do_login 会重新拉登录页、拿新 cookie，故清空无副作用。
+        session.cookies.clear()
         ok, msg = do_login(session, args.username, args.password)
         if not ok:
             print(f"[FAIL] 登录失败: {msg}")

@@ -97,14 +97,20 @@ def cookies_to_header(session):
 
 
 def get_page_text(resp):
-    """优先按 GBK 解码（论坛是 GBK）"""
-    if resp.encoding and resp.encoding.lower() in ("gbk", "gb2312", "gb18030"):
-        return resp.text
-    try:
-        return resp.content.decode("gbk")
-    except (UnicodeDecodeError, LookupError):
-        resp.encoding = resp.apparent_encoding or "utf-8"
-        return resp.text
+    """按响应声明的编码解码。论坛实际是 UTF-8（Content-Type 明确声明），
+    之前强制按 GBK 解码会把 UTF-8 中文解成乱码，导致“欢迎您回来”等
+    中文判定全部失效。"""
+    if resp.encoding:
+        try:
+            return resp.content.decode(resp.encoding)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    for enc in ("utf-8", "gbk"):
+        try:
+            return resp.content.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return resp.content.decode("utf-8", errors="ignore")
 
 
 def fetch_forum(session):
@@ -508,11 +514,12 @@ def _submit_login(session, formhash, loginhash, username="", password="",
         if cdata:
             msg = re.sub(r"<[^>]+>", "", cdata.group(1)).strip()
 
-    # 登录成功页的直接信号：Discuz 成功页含 succeedmessage/succeedlocation
-    # 元素或“欢迎您回来”，POST 响应本身就是权威结果，不必再依赖首页二次校验。
-    # 注意：只认 id="..." 元素或成功问候语，不认 JS 里的 $('succeedmessage')
-    # 引用（错误页也可能含同一段共用 JS），避免把错误页误判为成功。
-    if (re.search(r'id\s*=\s*["\']succeed(?:message|location)["\']', txt)
+    # 登录成功页的直接信号：Discuz 成功页含 succeedmessage/main_succeed
+    # 或“欢迎您回来”，POST 响应本身就是权威结果，不必再依赖首页二次校验。
+    # 实测：错误页（验证码/密码错误）不含 succeedmessage 与 main_succeed，
+    # 故直接用裸子串判定；get_page_text 已按声明编码（UTF-8）解码，
+    # 中文不再乱码，“欢迎您回来”可正常匹配。
+    if ("succeedmessage" in txt or "main_succeed" in txt
             or "欢迎您回来" in txt):
         return True, "登录成功", txt
 

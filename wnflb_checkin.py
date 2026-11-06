@@ -4,7 +4,7 @@
 福利吧论坛 (wnflb2023.com) 自动签到脚本
 =======================================
 基于 Discuz! X3.4，支持两种认证方式：
-  1. 账号密码登录（自动处理验证码，ddddocr 识别，失败后 Gemini 视觉兜底）
+  1. 账号密码登录（登录页自带验证码时先识别再提交，ddddocr 识别，失败后 Gemini 视觉兜底）
   2. 直接传入 Cookie（兼容旧方式）
 
 特性：
@@ -522,33 +522,116 @@ def _submit_login(session, formhash, loginhash, username="", password="",
     return False, (msg or "登录失败（未进入登录态）"), txt
 
 
+def _find_auth(html):
+    """从响应 HTML 里找二次挑战的 auth 令牌。
+    与原有逻辑完全一致：先取 name="auth" 隐藏域（unquote 还原；
+    auth 在 HTML 里可能以 %2F 形式存在（含 /），需先还原再提交，
+    否则会被二次编码导致服务端认不出令牌），找不到再从 auth=...
+    参数里找；都没有返回 None。"""
+    _, _, auth = extract_login_fields(html)
+    if auth:
+        return urllib.parse.unquote(auth)
+    am = re.search(r"auth=([A-Za-z0-9%_./=+]+)", html)
+    if am:
+        return urllib.parse.unquote(am.group(1))
+    return None
+
+
+def _is_captcha_failure(msg, html):
+    """判断一次登录失败是否由验证码引起。
+    只认论坛明确的验证码报错文案，避免把密码错误等误判为验证码问题。"""
+    if msg and "验证码" in msg:
+        return True
+    if html and "请输入验证码" in html:
+        return True
+    return False
+
+
+def _presolve_captcha(session, cap):
+    """登录页自带验证码时，先识别再提交。
+    先 ddddocr；无果或校验未通过时用 Gemini 兜底一次。
+    返回识别出的验证码，失败返回 None。"""
+    code = solve_captcha(session, cap)
+    if code:
+        print(f"  [验证码] 预识别采用 ddddocr 结果: {code!r}")
+        if verify_captcha_code(session, cap, code):
+            return code
+        print("  [验证码] 预识别 ddddocr 结果校验未通过，改用 Gemini 再试 ...")
+    else:
+        print("  [验证码] ddddocr 无果，改用 Gemini 视觉识别兜底 ...")
+    code2 = solve_captcha_gemini(session, cap)
+    if code2:
+        print(f"  [验证码] 预识别采用 Gemini 结果: {code2!r}")
+        verify_captcha_code(session, cap, code2)  # best effort：设 seccode cookie
+        return code2
+    print("  [验证码] 预识别失败（ddddocr 与 Gemini 均无结果）")
+    return None
+
+
+def _submit_with_presolve(session, html, formhash, loginhash, username, password):
+    """带登录页验证码预识别的一次登录提交。
+    登录页自带验证码时先识别（ddddocr→Gemini），校验一次（best effort，
+    设置 seccode cookie），再把验证码随登录一起提交；无验证码时与原来
+    一致（直接提交）。返回 _submit_login 的 (ok, msg, resp_html)。"""
+    cap = detect_captcha(html)
+    code, seccodehash = None, ""
+    if cap["needed"] and cap["idhash"]:
+        print(f"  [登录] 登录页自带验证码 idhash={cap['idhash']}，先识别再提交 ...")
+        code = _presolve_captcha(session, cap)
+        if code:
+            seccodehash = cap["seccodehash"] or cap["idhash"]
+        else:
+            print("  [登录] 登录页验证码预识别失败，仍按无验证码提交（后续走二次挑战）")
+    return _submit_login(session, formhash, loginhash, username, password,
+                         code, None, seccodehash)
+
+
 def do_login(session, username, password):
     """
     账号密码登录（含新 IP 二次验证码挑战）。
     成功返回 (True, 消息)，失败返回 (False, 消息)。
+
+    流程：
+      0. 取登录页；若登录页自带验证码，先预识别（ddddocr→Gemini），
+         校验一次（best effort），再带验证码提交。
+      1. 首次提交若因验证码失败且响应里无 auth：重取登录页，
+         用新 idhash 再走一遍预识别+提交，最多一次。
+      2. 若响应带 auth：走二次验证码挑战循环（原有逻辑）。
     """
     print("  [登录] 获取登录页 ...")
     html, formhash, loginhash = fetch_login_page(session)
     if not formhash or not loginhash:
         return False, "无法解析登录页(formhash/loginhash 缺失)"
 
-    # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
-    ok, msg, resp_html = _submit_login(
-        session, formhash, loginhash, username, password, None, None
+    # 步骤 0：登录页自带验证码时先预识别，再提交
+    # （无验证码时与原来一致：直接提交）
+    ok, msg, resp_html = _submit_with_presolve(
+        session, html, formhash, loginhash, username, password
     )
     if ok:
         return True, msg
 
-    # 被验证码挑战：从第一次提交的响应里直接解析挑战页（auth 由本次响应给出）。
-    # 关键：auth 在 HTML 里可能以 %2F 形式存在（含 /），需先 unquote 还原，
-    # 再交给 _submit_login 统一按 form-urlencoded 编码，否则会被二次编码导致
-    # 服务端认不出令牌、报"密码空或包含非法字符"。
+    # 步骤 1：提交因验证码失败且响应里无 auth（当前死路）：
+    # 重取登录页、用新 idhash 再走一遍预识别+提交，最多一次
+    if _is_captcha_failure(msg, resp_html) and not _find_auth(resp_html or ""):
+        print("  [登录] 首次提交验证码失败且无 auth，重取登录页再试一次 ...")
+        try:
+            html2, formhash2, loginhash2 = fetch_login_page(session)
+        except requests.RequestException as e:
+            return False, f"重取登录页异常: {e}"
+        if formhash2 and loginhash2:
+            ok, msg, resp_html = _submit_with_presolve(
+                session, html2, formhash2, loginhash2, username, password
+            )
+            if ok:
+                return True, msg
+        return False, msg
+
+    # 步骤 2：二次验证码挑战（原有逻辑，从响应里解析 auth；auth 由本次响应给出，
+    # 在 HTML 里可能以 %2F 形式存在，需先 unquote 还原，见 _find_auth）
     chtml = resp_html or ""
-    c_fh, c_lh, auth = extract_login_fields(chtml)
-    auth = urllib.parse.unquote(auth) if auth else None
-    if not auth:
-        am = re.search(r"auth=([A-Za-z0-9%_./=+]+)", chtml)
-        auth = urllib.parse.unquote(am.group(1)) if am else None
+    c_fh, c_lh, _ = extract_login_fields(chtml)
+    auth = _find_auth(chtml)
     if not auth:
         return False, msg  # 真失败（密码错等），msg 已是原因
 

@@ -4,13 +4,13 @@
 福利吧论坛 (wnflb2023.com) 自动签到脚本
 =======================================
 基于 Discuz! X3.4，支持两种认证方式：
-  1. 账号密码登录（自动处理验证码，ddddocr 识别）
+  1. 账号密码登录（自动处理验证码，ddddocr 识别，失败后 Gemini 视觉兜底）
   2. 直接传入 Cookie（兼容旧方式）
 
 特性：
   - 登录成功后把 Cookie 保存到本地/cache，下次优先复用
   - Cookie 失效自动重新用账号密码登录（含验证码）
-  - 新 IP 登录需要验证码时自动拉取并识别（ddddocr）
+  - 新 IP 登录需要验证码时自动拉取并识别（ddddocr，失败后 Gemini 视觉兜底）
   - 支持 PushPlus / Server 酱 微信推送
   - 论坛为 GBK 编码，已做兼容
 
@@ -19,11 +19,14 @@
   FORUM_PASSWORD   密码
   FORUM_COOKIE     直接传入的 Cookie 字符串（优先级高于 cookie 文件）
   COOKIE_FILE      Cookie 缓存文件路径（默认 cookies.json）
+  GEMINI_API_KEY   Gemini 视觉识别 key（可选；为空时只用 ddddocr）
+  GEMINI_MODEL     视觉模型名（可选，默认 gemini-3.6-flash）
   PUSHPLUS_TOKEN   PushPlus 推送 token
   SERVERCHAN_KEY   Server 酱推送 key
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -41,6 +44,23 @@ LOGIN_PAGE_URL = BASE_URL + "/member.php?mod=logging&action=login"
 TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAY = 5
+
+# 验证码视觉识别兜底（Gemini）：ddddocr 失败后才调用，需 GEMINI_API_KEY。
+# 模型选择说明（2026-11-06 核实官方文档 https://ai.google.dev/gemini-api/docs/models）：
+#   gemini-2.0-flash 已不在当前官方模型列表中，改用同系列 Stable 的
+#   gemini-3.6-flash（多模态，免费层可用）；可用 GEMINI_MODEL 环境变量覆盖。
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+# 只要求返回图中字符、不加解释；回答越短，解析越稳。
+GEMINI_PROMPT = (
+    "Return only the characters shown in this CAPTCHA image, "
+    "with no explanation or extra text."
+)
+# GEMINI_API_KEY 未配置时只提示一次，避免每次登录都刷屏
+_GEMINI_NO_KEY_WARNED = False
 
 HEADERS = {
     "User-Agent": (
@@ -259,11 +279,17 @@ def extract_login_fields(html):
     )
 
 
+def is_valid_captcha_code(code):
+    """论坛验证码格式校验：Discuz 默认 4 位字母数字。不合格式视为识别失败。"""
+    return isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9]{4}", code) is not None
+
+
 def solve_captcha(session, cap):
     """
     拉取验证码图片并用 ddddocr 识别。
     多次重试（每次换一张新图），提高识别率。
-    返回识别出的验证码字符串，失败返回 None。
+    只返回格式合法的验证码（4 位字母数字），否则继续换图；
+    全部失败返回 None（调用方再决定是否用 Gemini 兜底）。
     """
     try:
         import ddddocr  # 仅在需要验证码时才 import
@@ -292,10 +318,99 @@ def solve_captcha(session, cap):
             code = ocr.classification(r.content).strip()
             print(f"  [验证码] 第 {attempt} 次识别结果: {code!r}")
             if code:
-                return code
+                if is_valid_captcha_code(code):
+                    return code
+                print("  [验证码] 第 {attempt} 次识别结果格式非法，换图重试")
         except Exception as e:
             print(f"  [验证码] 第 {attempt} 次识别异常: {e}")
     return None
+
+
+def _extract_captcha_text(text):
+    """从 Gemini 返回文本中提取验证码。
+    模型按要求只返回字符本身；兼容少量多余文字：先整体清洗，
+    恰为 4 位则采用；否则取最后一个 4 位字母数字词（排除常见英文词）。"""
+    if not text:
+        return None
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", text)
+    if len(cleaned) == 4:
+        return cleaned
+    stop = {"code", "text", "that", "this", "with", "from", "here",
+            "your", "read", "show", "imag", "char", "capt"}
+    words = re.findall(r"[A-Za-z0-9]{4}", text)
+    cands = [w for w in words if w.lower() not in stop]
+    if cands:
+        return cands[-1]
+    return None
+
+
+def solve_captcha_gemini(session, cap):
+    """
+    用 Gemini 视觉模型识别验证码（ddddocr 失败后的兜底）。
+    需要环境变量 GEMINI_API_KEY；未配置时静默返回 None，
+    不影响现有 ddddocr 流程。任何异常都返回 None，绝不抛错。
+    返回识别出的验证码字符串，失败返回 None。
+    """
+    global _GEMINI_NO_KEY_WARNED
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        if not _GEMINI_NO_KEY_WARNED:
+            print("  [验证码] 未配置 GEMINI_API_KEY，跳过 Gemini 视觉兜底")
+            _GEMINI_NO_KEY_WARNED = True
+        return None
+
+    # 拉一张新图（与 ddddocr 同样的接口与 Referer 要求）
+    headers = {"Referer": LOGIN_PAGE_URL}
+    try:
+        update = str(int(time.time() * 1000))
+        img_url = (
+            f"{BASE_URL}/misc.php?mod=seccode"
+            f"&update={update}&idhash={cap['idhash']}"
+        )
+        r = session.get(img_url, timeout=TIMEOUT, headers=headers)
+    except requests.RequestException as e:
+        print(f"  [验证码] Gemini 拉取图片异常: {e}")
+        return None
+    if r.status_code != 200 or len(r.content) < 100:
+        print(f"  [验证码] Gemini 拉取图片失败(status={r.status_code}, len={len(r.content)})")
+        return None
+    if r.content[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
+        print("  [验证码] Gemini 拉取到非图片(可能被拦截)")
+        return None
+
+    mime = "image/png" if r.content[:4] == b"\x89PNG" else "image/jpeg"
+    img_b64 = base64.b64encode(r.content).decode("ascii")
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": mime, "data": img_b64}},
+                {"text": GEMINI_PROMPT},
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 16},
+    }
+    try:
+        resp = requests.post(
+            f"{GEMINI_API_URL}?key={api_key}",
+            json=payload, timeout=TIMEOUT,
+        )
+    except requests.RequestException as e:
+        print(f"  [验证码] Gemini 请求异常: {e}")
+        return None
+    if resp.status_code != 200:
+        print(f"  [验证码] Gemini 返回 HTTP {resp.status_code}: {resp.text[:200]!r}")
+        return None
+    try:
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        print(f"  [验证码] Gemini 返回解析失败: {e}，原文: {resp.text[:200]!r}")
+        return None
+    code = _extract_captcha_text(text)
+    print(f"  [验证码] Gemini 识别原文: {text!r} -> 提取: {code!r}")
+    if code and not is_valid_captcha_code(code):
+        return None
+    return code
 
 
 def verify_captcha_code(session, cap, code):
@@ -469,15 +584,44 @@ def do_login(session, username, password):
 
     # 二次挑战提交（不带账号密码，凭据由 auth 关联）。最多 3 次换图重试；
     # 若仍报凭据缺失（auth 失效 / 编码问题），则重拉挑战页拿新 auth 再试。
+    # 验证码识别：先 ddddocr（每轮最多 3 张图），无果或格式非法时，
+    # 用 Gemini 视觉模型对新图再试一次（整轮登录最多一次，避免多余调用）；
+    # 论坛校验接口返回验证码错误时同样触发一次 Gemini 兜底。
     last_msg = "验证码识别失败"
+    gemini_tried = False
     for attempt in range(1, 4):
         print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
         code = solve_captcha(session, cap)
+        recognizer = "ddddocr"
+        if not code and not gemini_tried:
+            gemini_tried = True
+            print("  [登录] ddddocr 无果，改用 Gemini 视觉识别兜底 ...")
+            code = solve_captcha_gemini(session, cap)
+            recognizer = "Gemini"
         if not code:
-            return False, "验证码识别失败，请检查 ddddocr 或手动处理"
+            if attempt < 3:
+                print("  [登录] 本轮验证码识别失败，换新图重试 ...")
+                continue
+            return False, "验证码识别失败，请检查 ddddocr/GEMINI_API_KEY 或手动处理"
 
+        print(f"  [验证码] 采用 {recognizer} 识别结果: {code!r}")
         # 调用验证码校验接口（设置 seccode cookie，确认识别是否正确）
         if not verify_captcha_code(session, cap, code):
+            # 校验未通过：若 Gemini 还没试过，对新图再试一次
+            if not gemini_tried:
+                gemini_tried = True
+                print("  [验证码] 校验未通过，改用 Gemini 视觉识别兜底再试 ...")
+                code2 = solve_captcha_gemini(session, cap)
+                if code2:
+                    print(f"  [验证码] 采用 Gemini 识别结果: {code2!r}")
+                    if verify_captcha_code(session, cap, code2):
+                        code = code2
+                    else:
+                        print(f"  [登录] 第 {attempt} 次 Gemini 验证码校验未通过，换新图重试 ...")
+                        continue
+                else:
+                    print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
+                    continue
             print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
             continue
 
